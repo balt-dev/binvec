@@ -135,11 +135,14 @@ impl<T: BitBuffer + Copy> SharedBitBuffer for Cell<T> {
     }
 }
 
+#[cfg(not(tarpaulin_include))]
 pub trait BorrowType: seal::BorrowSeal { }
 
+#[cfg(not(tarpaulin_include))]
 /// Marks a binary borrow as immutable.
 pub enum Const {}
 impl BorrowType for Const { }
+#[cfg(not(tarpaulin_include))]
 /// Marks a binary borrow as mutable.
 pub enum Mut {}
 impl BorrowType for Mut { }

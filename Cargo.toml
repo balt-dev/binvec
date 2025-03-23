@@ -5,3 +5,7 @@ edition = "2024"
 authors = ["baltdev"]
 description = "Implements a binary vector modeled after std's Vec."
 repository = "https://github.com/balt-dev/binvec"
+
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(tarpaulin_include)'] }
