@@ -55,9 +55,10 @@ pub trait SharedBitBuffer: BitBuffer {
 }
 
 macro_rules! bitwidth {
-    ($($ty: ty)*) => {
-        $(impl BitBuffer for $ty {
-            const WIDTH: usize = core::mem::size_of::<$ty>() * 8;
+    ($($ty: ty: $uty: ty)*) => {
+        $(
+        impl BitBuffer for $uty {
+            const WIDTH: usize = core::mem::size_of::<$uty>() * 8;
             const ZERO: Self = 0;
             unsafe fn set_bit(&mut self, index: usize, value: bool) {
                 unsafe {
@@ -73,21 +74,39 @@ macro_rules! bitwidth {
                     ).checked_shr(index as u32).unwrap_unchecked()
                 }) > 0
             }
+        }
+        impl BitBuffer for $ty {
+            const WIDTH: usize = core::mem::size_of::<$ty>() * 8;
+            const ZERO: Self = 0;
+            unsafe fn set_bit(&mut self, index: usize, value: bool) {
+                unsafe {
+                    *self &= (!Self::ZERO) ^ (1 as $uty).checked_shl(index as u32).unwrap_unchecked() as $ty;
+                    *self |= (value as $uty).checked_shl(index as u32).unwrap_unchecked() as $ty;
+                }
+            }
+            unsafe fn get_bit(&self, index: usize) -> bool {
+                (unsafe {
+                    (
+                        (*self as $uty) & (1 as $uty).checked_shl(index as u32).unwrap_unchecked()
+                    ).checked_shr(index as u32).unwrap_unchecked()
+                }) > 0
+            }
         })*
     };
 }
 
-bitwidth!(u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
+bitwidth!(i8: u8 i16: u16 i32: u32 i64: u64 i128: u128 isize: usize);
+
 impl<T: BitBuffer, const N: usize> BitBuffer for [T; N] {
     const WIDTH: usize = T::WIDTH * N;
     const ZERO: Self = [T::ZERO; N];
     unsafe fn get_bit(&self, index: usize) -> bool {
-        let arr_index = index / Self::WIDTH;
-        unsafe { self[arr_index].get_bit(index % Self::WIDTH) }
+        let arr_index = index / T::WIDTH;
+        unsafe { self[arr_index].get_bit(index % T::WIDTH) }
     }
     unsafe fn set_bit(&mut self, index: usize, value: bool) {
-        let arr_index = index / Self::WIDTH;
-        unsafe { self[arr_index].set_bit(index % Self::WIDTH, value) }
+        let arr_index = index / T::WIDTH;
+        unsafe { self[arr_index].set_bit(index % T::WIDTH, value) }
     }
 }
 impl<T: BitBuffer + Copy> BitBuffer for Cell<T> {
