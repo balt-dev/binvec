@@ -9,3 +9,7 @@ repository = "https://github.com/balt-dev/binvec"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(tarpaulin_include)'] }
+
+[features]
+default = ["alloc"]
+alloc = []

@@ -1,4 +1,4 @@
-use core::{cell::Cell, fmt::{Debug, Display}, marker::PhantomData, ops::{Deref, Index, RangeBounds}, ptr::NonNull};
+use core::{cell::Cell, fmt::{Debug, Display}, hint::assert_unchecked, marker::PhantomData, ops::{Deref, Index, IndexMut, RangeBounds}, ptr::NonNull};
 
 
 mod seal {
@@ -80,16 +80,16 @@ macro_rules! bitwidth {
             const ZERO: Self = 0;
             unsafe fn set_bit(&mut self, index: usize, value: bool) {
                 unsafe {
-                    *self &= (!Self::ZERO) ^ (1 as $uty).checked_shl(index as u32).unwrap_unchecked() as $ty;
-                    *self |= (value as $uty).checked_shl(index as u32).unwrap_unchecked() as $ty;
+                    assert_unchecked(index < Self::WIDTH);
                 }
+                *self &= ((!Self::ZERO as $uty) ^ (1 as $uty) << (index as u32)) as $ty;
+                *self |= ((value as $uty) << (index as u32)) as $ty;
             }
             unsafe fn get_bit(&self, index: usize) -> bool {
-                (unsafe {
-                    (
-                        (*self as $uty) & (1 as $uty).checked_shl(index as u32).unwrap_unchecked()
-                    ).checked_shr(index as u32).unwrap_unchecked()
-                }) > 0
+                unsafe {
+                    assert_unchecked(index < Self::WIDTH);
+                }
+                (((*self as $uty) & ((1 as $uty) << index)) >> index) > 0
             }
         })*
     };
@@ -113,10 +113,14 @@ impl<T: BitBuffer + Copy> BitBuffer for Cell<T> {
     const WIDTH: usize = T::WIDTH;
     const ZERO: Self = Cell::new(T::ZERO);
     unsafe fn set_bit(&mut self, index: usize, value: bool) {
-        unsafe { self.set_shared_bit(index % Self::WIDTH, value) }
+        unsafe { 
+            self.set_shared_bit(index, value)
+        }
     }
     unsafe fn get_bit(&self, index: usize) -> bool {
-        unsafe { self.get().get_bit(index % Self::WIDTH) }
+        unsafe { 
+            self.get().get_bit(index)
+        }
     }
 }
 
@@ -130,7 +134,7 @@ impl<T: SharedBitBuffer, const N: usize> SharedBitBuffer for [T; N] {
 impl<T: BitBuffer + Copy> SharedBitBuffer for Cell<T> {
     unsafe fn set_shared_bit(&self, index: usize, value: bool) {
         let mut inner = self.get();
-        unsafe { inner.set_bit(index % Self::WIDTH, value) };
+        unsafe { inner.set_bit(index, value) };
         self.set(inner);
     }
 }
@@ -171,6 +175,16 @@ impl<'slice, Ref: BorrowType, Word: BitBuffer + 'slice> BinarySlice<'slice, Ref,
         unsafe { &*(self as *const BinarySlice<'slice, Ref, Word> as *const BinarySlice<'slice, R, Word>) }
     }
 
+    /// Returns whether the start of the binary slice is aligned to a word.
+    pub const fn start_aligned(&self) -> bool {
+        self.start % Word::WIDTH == 0
+    }
+
+    /// Returns whether the end of the binary slice is aligned to a word.
+    pub const fn end_aligned(&self) -> bool {
+        (self.start + self.length) % Word::WIDTH == 0
+    }
+
     /// Converts a slice of any kind to another.
     /// 
     /// # Safety
@@ -182,7 +196,7 @@ impl<'slice, Ref: BorrowType, Word: BitBuffer + 'slice> BinarySlice<'slice, Ref,
     /// For [`Const`] -> [`Mut`], the reference must be unique when returned to safe code.
     pub const unsafe fn into_this<R: BorrowType>(self) -> BinarySlice<'slice, R, Word> {
         unsafe {
-            let (start, len, data) = self.to_raw_parts();
+            let (start, len, data) = self.into_raw_parts();
             BinarySlice::from_raw_parts(start, len, data)
         }
     }
@@ -216,7 +230,7 @@ impl<'slice, Ref: BorrowType, Word: BitBuffer + 'slice> BinarySlice<'slice, Ref,
     };
 
     /// Decomposes a slice reference to a binary slice to its start, length, and data pointer.
-    pub const fn to_raw_parts(&self) -> (usize, usize, NonNull<Word>) {
+    pub const fn into_raw_parts(self) -> (usize, usize, NonNull<Word>) {
         (self.start, self.length, self.data)
     }
 
@@ -260,14 +274,29 @@ impl<'slice, Ref: BorrowType, Word: BitBuffer + 'slice> BinarySlice<'slice, Ref,
             core::ops::Bound::Excluded(&usize::MAX) => return None,
             core::ops::Bound::Excluded(e) => *e+1,
         };
+        if start >= self.len() { return None; }
         let length: usize = match bounds.end_bound() {
             core::ops::Bound::Included(&usize::MAX) |
             core::ops::Bound::Unbounded => usize::MAX,
             core::ops::Bound::Included(i) => *i+1,
             core::ops::Bound::Excluded(0) => return None,
             core::ops::Bound::Excluded(e) => *e,
-        }.min(self.length).checked_sub(start)?;
+        }.min(self.length);
         Some((start, length))
+    }
+
+    /// Slices the array, returning a subsection of it. Returns None if the slice is out of bounds or inverted.
+    /// 
+    /// # Example
+    /// ```rust
+    /// # use binvec::prelude::*;
+    /// let s = binslice![1 1 1 0 0 0];
+    /// eprintln!("{s} ");
+    /// assert!(s[0]);
+    /// ```
+    pub fn sub(self, bounds: impl RangeBounds<usize>) -> Option<Self> {
+        let (start, length) = self.get_sub_bounds(bounds)?;
+        Some(unsafe { Self::from_raw_parts(start, length, self.data) })
     }
 }
 
@@ -283,12 +312,6 @@ impl<'slice, Ref: BorrowType, Word: BitBuffer> Index<usize> for BinarySlice<'sli
 }
 
 impl<'slice, Word: BitBuffer + 'slice> BinarySlice<'slice, Const, Word> {
-    /// Slices the array, returning a subsection of it. Returns None if the slice is out of bounds or inverted.
-    pub fn sub(&self, bounds: impl RangeBounds<usize>) -> Option<Self> {
-        let (start, length) = self.get_sub_bounds(bounds)?;
-        Some(unsafe { Self::from_raw_parts(start, length, self.data) })
-    }
-
     /// Constructs a bitslice from a slice of binary words and a length.
     /// 
     /// Note that bits are counted from the first bit up, so a slice
@@ -307,6 +330,7 @@ impl<'slice, Word: BitBuffer + 'slice> BinarySlice<'slice, Const, Word> {
     /// assert!(!BITS[1]);
     /// assert!(BITS.get(9).is_none());
     /// ```
+    // TODO: Add start: usize parameter
     pub const fn from_word_slice(slice: &'slice [Word], length: usize) -> Option<Self> {
         let mut len = slice.len() * Word::WIDTH;
         if len < length { return None; }
@@ -316,6 +340,24 @@ impl<'slice, Word: BitBuffer + 'slice> BinarySlice<'slice, Const, Word> {
             len,
             NonNull::new(slice.as_ptr() as *mut _).expect("slice reference should not be null")
         )})
+    }
+
+    /// Deconstructs the slice reference into its underlying word buffer, and a start and length index into that buffer.
+    /// 
+    /// Note that this will contain bits not within the slice if the start and end are not aligned -
+    /// this can be checked with [`Self::start_aligned`] and [`Self::end_aligned`] respectively.
+    pub const fn into_word_slice(self) -> (&'slice [Word], usize, usize) {
+        let word_start = self.start / Word::WIDTH;
+        let word_end = (self.start + self.len()).div_ceil(Word::WIDTH);
+        let word_len = word_end - word_start;
+        let bit_start = self.start % Word::WIDTH;
+        let bit_length = (self.start + self.length) - word_start * Word::WIDTH;
+        (unsafe {
+            core::slice::from_raw_parts(
+                self.data.add(word_start).as_ptr(),
+                word_len
+            )
+        }, bit_start, bit_length)
     }
 }
 
@@ -369,11 +411,20 @@ impl<'slice, Word: BitBuffer + 'slice> BinarySlice<'slice, Mut, Word> {
         )})
     }
 
-
-    /// Slices the array, returning a subsection of it. Returns None if the slice is out of bounds or inverted.
-    pub fn sub(&mut self, bounds: impl RangeBounds<usize>) -> Option<Self> {
-        let (start, length) = self.get_sub_bounds(bounds)?;
-        Some(unsafe { Self::from_raw_parts(start, length, self.data) })
+    /// Deconstructs the slice reference into its underlying word buffer.
+    /// 
+    /// Note that this will contain bits not within the slice if the start and end are not aligned -
+    /// this can be checked with [`Self::start_aligned`] and [`Self::end_aligned`] respectively.
+    pub const fn into_word_slice(self) -> &'slice mut [Word] {
+        let word_start = self.start / Word::WIDTH;
+        let word_end = (self.start + self.len()).div_ceil(Word::WIDTH);
+        let word_len = word_end - word_start;
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.data.add(word_start).as_ptr(),
+                word_len
+            )
+        }
     }
 }
 
@@ -455,3 +506,118 @@ unsafe impl<'slice, Word: BitBuffer> Sync for BinarySlice<'slice, Const, Word> {
 
 unsafe impl<'slice, Word: SharedBitBuffer> Send for BinarySlice<'slice, Mut, Word> {}
 unsafe impl<'slice, Word: SharedBitBuffer> Sync for BinarySlice<'slice, Mut, Word> {}
+
+
+#[diagnostic::on_unimplemented(
+    label = "if you're trying to set a value within a binary slice, use `BinarySlice::set`",
+)]
+trait _NoIndexMut {}
+
+#[diagnostic::do_not_recommend]
+impl<'s, R, B> IndexMut<usize> for BinarySlice<'s, R, B> where for<'__> Self : _NoIndexMut, R: BorrowType, B: BitBuffer
+{ fn index_mut(&mut self, _index: usize) -> &mut Self::Output { unimplemented!() } }
+
+/// Constructs a `'static` binary slice.
+/// 
+/// Due to macro limitations, this always uses a [`u8`] as its underlying type,
+/// and each 0 and 1 must be space-separated. Commas will be ignored.
+/// 
+/// # Example
+/// 
+/// ```rust
+/// # use binvec::binslice;
+/// 
+/// assert_eq!(
+///     (binslice![ 1 1 1 0 0 1 1 0, 1 1 0 ].into_word_slice().0),
+///     [0b01100111u8, 0b011]
+/// )
+/// ```
+#[macro_export]
+macro_rules! binslice {
+    [] => { $crate::borrow::BinarySlice::EMPTY };
+    [$($tt: tt)+] => { $crate::_binslice!(@construct [$($tt)+] ) };
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! _binslice {
+    [@count $tt: tt $($tts: tt)*] => {
+        1 + $crate::_binslice!(@count $($tts)*)
+    };
+    [@count] => {
+        0
+    };
+    [@construct [0 $($tt: tt)*] $($bits: literal)*] => {
+        $crate::_binslice!(@construct [$($tt)*] $($bits)* 0)
+    };
+    [@construct [1 $($tt: tt)*] $($bits: literal)*] => {
+        $crate::_binslice!(@construct [$($tt)*] $($bits)* 1)
+    };
+    [@construct [, $($tt: tt)*] $($bits: literal)*] => {
+        $crate::_binslice!(@construct [$($tt)*] $($bits)*)
+    };
+    [@construct [] $($rest: literal)*] => {
+        $crate::borrow::BinarySlice::<'static, $crate::borrow::Const, u8>::from_word_slice(
+            $crate::_binslice!(@list $crate::_binslice!(@create $($rest)* | | )),
+            $crate::_binslice!(@count $($rest)+ )
+        ).unwrap()
+    };
+    [@list $expr: expr ] => {& $expr };
+    [@create |  | $($num: expr)* ] => {[$($num),*]};
+    [@create $a: literal $($rest: literal)* |  | $($num: expr)* ] => {
+        $crate::_binslice!(@create $($rest)* | $a | $($num)* )
+    };
+    [@create | $a: literal | $($num: expr)* ] => {[
+        $($num,)*
+        $a as u8
+    ]};
+    [@create $b: literal $($rest: literal)* | $a: literal | $($num: expr)* ] => {
+        $crate::_binslice!(@create $($rest)* | $a $b | $($num)* )
+    };
+    [@create | $a: literal $b: literal | $($num: expr)* ] => {[
+        $($num,)*
+        (($a as u8) | (($b as u8) << 1))
+    ]};
+    [@create $c: literal $($rest: literal)* | $a: literal $b: literal | $($num: expr)* ] => {
+        $crate::_binslice!(@create $($rest)* | $a $b $c | $($num)* )
+    };
+    [@create | $a: literal $b: literal $c: literal | $($num: expr)* ] => {[
+        $($num,)*
+        (($a as u8) | (($b as u8) << 1) | (($c as u8) << 2))
+    ]};
+    [@create $d: literal $($rest: literal)* | $a: literal $b: literal $c: literal | $($num: expr)* ] => {
+        $crate::_binslice!(@create $($rest)* | $a $b $c $d | $($num)* )
+    };
+    [@create | $a: literal $b: literal $c: literal $d: literal | $($num: expr)* ] => {[
+        $($num,)*
+        (($a as u8) | (($b as u8) << 1) | (($c as u8) << 2) | (($d as u8) << 3))
+    ]};
+    [@create $e: literal $($rest: literal)* | $a: literal $b: literal $c: literal $d: literal | $($num: expr)* ] => {
+        $crate::_binslice!(@create $($rest)* | $a $b $c $d $e | $($num)* )
+    };
+    [@create | $a: literal $b: literal $c: literal $d: literal $e: literal | $($num: expr)* ] => {[
+        $($num,)*
+        (($a as u8) | (($b as u8) << 1) | (($c as u8) << 2) | (($d as u8) << 3) | (($e as u8) << 4))
+    ]};
+    [@create $f: literal $($rest: literal)* | $a: literal $b: literal $c: literal $d: literal $e: literal | $($num: expr)* ] => {
+        $crate::_binslice!(@create $($rest)* | $a $b $c $d $e $f | $($num)* )
+    };
+    [@create | $a: literal $b: literal $c: literal $d: literal $e: literal $f: literal | $($num: expr)* ] => {[
+        $($num,)*
+        (($a as u8) | (($b as u8) << 1) | (($c as u8) << 2) | (($d as u8) << 3) | (($e as u8) << 4) | (($f as u8) << 5))
+    ]};
+    [@create $g: literal $($rest: literal)* | $a: literal $b: literal $c: literal $d: literal $e: literal $f: literal | $($num: expr)* ] => {
+        $crate::_binslice!(@create $($rest)* | $a $b $c $d $e $f $g | $($num)* )
+    };
+    [@create | $a: literal $b: literal $c: literal $d: literal $e: literal $f: literal $g: literal | $($num: expr)* ] => {[
+        $($num,)*
+        (($a as u8) | (($b as u8) << 1) | (($c as u8) << 2) | (($d as u8) << 3) | (($e as u8) << 4) | (($f as u8) << 5) | (($g as u8) << 6))
+    ]};
+    [@create $h: literal $($rest: literal)* | $a: literal $b: literal $c: literal $d: literal $e: literal $f: literal $g: literal | $($num: expr)* ] => {
+        $crate::_binslice!(
+            @create $($rest)* |  | 
+            ($a as u8 | (($b as u8) << 1) | (($c as u8) << 2) | (($d as u8) << 3) | (($e as u8) << 4) | (($f as u8) << 5) | (($g as u8) << 6) | (($h as u8) << 7))
+            $($num)*
+        )
+    };
+}
